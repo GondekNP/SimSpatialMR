@@ -1,0 +1,326 @@
+---
+title: "SECR Checkpoint/Sanity Check"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+library(secr)
+library(secrdesign)
+library(digest)
+library(sp)
+library(rgeos)
+library(adehabitatHR)
+library(tidyverse)
+library(doParallel)
+
+```
+
+## 3/4/20 SECR Simulation Update
+
+The following is a simulation function which takes in four variables (parameter density, par g0, par sigma, and desired model) and simulates a capture history, subsamples it or leaves it as is, and then fits a given model. Several relevant values are saved - 
+
+```{r eval = FALSE}
+sim.secr.replicate <- function(trapPath = 'detectorfileScaled.csv', wd = 'C:/Users/Nick/Documents/SubSECR/', baseLogsDir = 'ErrorLogs',
+                           baseRdsDir = 'RepObjects', summaryPath = 'SimSECR_Summary.csv', parList, subTypes = c('full', 'SRS25'),
+                           g0Model = c("g0 ~ 1")){
+  #Function to automate the process of attempting a SECR run and saving the eventual error
+  #or the successful output (NULL) in order to distribute to cores/instances
+  setwd(wd)
+
+  library(digest)
+  library(sp)
+  library(rgeos)
+  library(adehabitatHR)
+  library(tidyverse)
+  library(doParallel)
+  
+  library(secr)
+  library(secrdesign)
+  gc()
+  #initialize par conditions - in REAL PARAMETER terms 
+  g0Par = parList$g0Par
+  dPar = parList$dPar
+  sigPar = parList$sigPar
+  fitBuffPar = parList$fitBuffPar
+  popnBuffPar = parList$popnBuffPar
+  #establish where error logs will be saved if any 
+  logsDir = file.path(baseLogsDir, paste0("dPar_", dPar),
+                         paste0("g0Par_", g0Par),
+                         paste0("sigPar_", sigPar),
+                         paste0('buffPar_',fitBuffPar))
+  if(!dir.exists(logsDir)){dir.create(logsDir, recursive = TRUE)}
+  rdsDir = file.path(baseRdsDir, paste0("dPar_", dPar),
+                      paste0("g0Par_", g0Par),
+                      paste0("sigPar_", sigPar),
+                      paste0('buffPar_',fitBuffPar),
+                      paste0('model_',g0Model))
+  if(!dir.exists(rdsDir)){dir.create(rdsDir, recursive = TRUE)}
+  
+  trapGrid <- read_csv(trapPath,
+                       col_names = FALSE) %>% dplyr::select(X2, X3)
+  colnames(trapGrid) <- c("x","y")
+  trapGrid <- read.traps(data=trapGrid, detector = 'multi')
+  
+  #initialize lists to organize subsampled and full capthists and hairsamps data frames
+  hairSamps <- list()
+  capthists <- list()
+  modFit <- list()
+
+  trialPop <- sim.popn(D = dPar, core = trapGrid, buffer = popnBuffPar, model2d = "IHP")
+  capthists$full <- sim.capthist(trapGrid, popn = trialPop, detectpar = list(g0 = qlogis(g0Par), 
+                                                                             sigma = log(sigPar)), noccasions = 6)
+  simID = digest(capthists$full) #cryptographic uniqueID based on capture history. Same capthist will have same hash 
+  
+  for (subType in subTypes){
+    errPath = file.path(logsDir, paste0(simID, "_", subType, "_errorText.txt"))
+    # browser()
+    tryCatch({
+          hairSamps$full <- as.data.frame(capthists$full) #full will be part of all reps
+      
+          #subsample (or dont), save as capthist and fit selected model
+          if(!str_detect(subType, "full")){
+            hairSamps[[subType]] <- hairSamps$full %>% sample_n(floor(nrow(hairSamps$full)*(as.numeric(str_extract(subType, "\\d\\d"))/100)))
+          } #only robust to srs now
+                                            
+          capthists[[subType]] <- make.capthist(captures = hairSamps[[subType]], traps = trapGrid, fmt = 'trapID')
+          modFit[[subType]] <- secr.fit(capthist = capthists[[subType]], buffer = fitBuffPar, detectfn = 0, model = as.formula(g0Model))
+          
+          #get derived parameters if successful
+          g0Hat = plogis(modFit[[subType]]$fit$estimate[2])
+          g0HatBias = g0Hat / g0Par
+          
+          sigHat = plogis(modFit[[subType]]$fit$estimate[3])
+          sigHatBias = sigHat / sigPar
+          
+          dHat = derived(modFit[[subType]])["D","estimate"]
+          dHatBiasPct = dHat/dPar
+          dHatBias = dHat - dPar
+          
+          errorText = "SUCCESS"
+          write_lines(errorText, path = errPath)
+        }, error = function(e){
+           write_lines(as.character(e), path = errPath)
+        })
+        errorText = paste(read_lines(errPath), collapse = '\n')#not sure how to avoid this step... looks like the error handling makes its own environment
+        
+        if (!is.null(hairSamps$full)) {
+          nFull = nrow(hairSamps$full)
+          nSub = nrow(hairSamps[[subType]])
+          subFullProp = nSub/nFull
+        }
+        
+        for (i in c('g0Hat', 'g0HatBias', 'sigHat', 'sigHatBias', 'dHat', 'dHatBias', 'dHatBiasPct', 'g0Hat', 'g0HatBias', 'nFull', 'nSub', 'subFullProp')){
+          if (!exists(i)) {assign(i, NA)}
+        }
+        objPath = file.path(rdsDir, paste0(simID, '_', subType, '.rds'))
+        #determine useful info from reps and save in data frame/list backup
+        newLine = data.frame(simID, subType, dPar, dHat, dHatBiasPct, dHatBias, sigPar, 
+                             sigHat, sigHatBias, g0Par, g0Hat, g0HatBias,
+                             nFull, nSub, subFullProp, errorText, objPath)
+        newObj = list(simID, subType, dPar, dHat, dHatBiasPct, dHatBias, sigPar, 
+                            sigHat, sigHatBias, g0Par, g0Hat, g0HatBias,
+                            nFull, nSub, subFullProp,
+                            fullSamps = ifelse(is.null(hairSamps$full), NA, hairSamps$full),
+                            subSamps = ifelse(is.null(hairSamps[[subType]]), NA, hairSamps[[subType]]),
+                            fitted = ifelse(is.null(modFit[[subType]]), NA, modFit[[subType]]),
+                            errorText, objPath)
+        saveRDS(newObj, objPath)
+        ifelse(file.exists(summaryPath), 
+               write_csv(newLine, summaryPath, append = T), 
+               write_csv(newLine, summaryPath, append = F))
+  
+    }
+  
+}
+```
+
+Using this function, I ran a number of simulations using each combination of g0, sigma and dPar, generated using the the following loop:
+
+``` {r eval = FALSE}
+  dPars = seq(525.25, 5252.5, length.out = 10)
+  g0Pars = seq(.5, .9, length.out = 10)
+  sigPars = seq(10,1,-1)
+  parLists <- list()
+  j = 1
+  for (k in 1:10){
+    for (l in 1:10){
+      for (o in 1:10){
+        parLists[[j]] <- list(g0Par = g0Pars[k],
+                              dPar = dPars[l],
+                              sigPar = sigPars[o],
+                              popnBuffPar = 30,
+                              fitBuffPar = 10) 
+        j = j+1
+      }
+    }
+  }
+  
+  
+```
+```{r}
+dPars = seq(525.25, 5252.5, length.out = 10)
+dPars
+
+g0Pars = seq(.5, .9, length.out = 10)
+g0Pars
+
+sigPars = seq(10,1,-1)
+sigPars  
+```
+
+Now - reading in the actual generated data and summarizing by number of sims per combo.
+
+```{r}
+SimData = read.csv("C:/Users/Nick/Documents/SubSECR/SimSECR_Summary.csv")
+SimDataFailed <- filter(SimData, is.na(dHat))
+SimData <- filter(SimData, !is.na(dHat))
+SimSummary <- SimData %>% group_by(dPar, sigPar, g0Par) %>% summarise(nReps = n()) %>% 
+  mutate(toInclude = nReps>50)
+SimData <- left_join(SimData, SimSummary)
+SimDataSparse <- filter(SimData, !toInclude)
+SimData <- filter(SimData, toInclude)
+ggplot(SimSummary %>% filter(toInclude), aes(g0Par, sigPar)) +
+  geom_raster(aes(fill = nReps)) #Two scenarios that did not make my computer explode in parallel were high sigma, low g0 and high g0, low sigma
+
+```
+
+Not looking yet at dHat_full vs dHat_SRS25, just looking at dHat / dPar, was there a trend? First high sigma, low g0.
+
+``` {r}
+#make the par variables factors
+SimData <- SimData %>% mutate_at(c('dPar', 'g0Par', 'sigPar', 'subType'), as.factor)
+
+#at sigma == 9
+ggplot(SimData %>% filter(subType == 'full' & sigPar == 10), aes(g0Par, dPar)) +
+  geom_raster(aes(fill = dHatBiasPct)) +
+  ggtitle('Derived Density / Simulated Density (Full, Sigma = 10)')
+
+#at sigma == 8
+ggplot(SimData %>% filter(subType == 'full' & sigPar == 8), aes(g0Par, dPar)) +
+  geom_raster(aes(fill = dHatBiasPct)) +
+  ggtitle('Derived Density / Simulated Density (Full, Sigma = 8)')
+
+#at sigma == 2
+ggplot(SimData %>% filter(subType == 'full' & sigPar == 6), aes(g0Par, dPar)) +
+  geom_raster(aes(fill = dHatBiasPct)) + 
+  ggtitle('Derived Density / Simulated Density (Full, Sigma = 6)')
+
+
+#SRS25 raster
+#at sigma == 10
+ggplot(SimData %>% filter(subType == 'SRS25' & sigPar == 10), aes(g0Par, dPar)) +
+  geom_raster(aes(fill = dHatBiasPct)) +
+  ggtitle('Derived Density / Simulated Density (SRS25, Sigma = 10)')
+
+
+#at sigma == 8
+ggplot(SimData %>% filter(subType == 'SRS25' & sigPar == 8), aes(g0Par, dPar)) +
+  geom_raster(aes(fill = dHatBiasPct)) + 
+  ggtitle('Derived Density / Simulated Density (SRS25, Sigma = 8)')
+
+
+#at sigma == 6
+ggplot(SimData %>% filter(subType == 'SRS25' & sigPar == 6), aes(g0Par, dPar)) +
+  geom_raster(aes(fill = dHatBiasPct)) +
+  ggtitle('Derived Density / Simulated Density (SRS25, Sigma = 6)')
+
+
+```
+
+Now try low sigma, high g0.
+
+``` {r}
+#make the par variables factors
+SimData <- SimData %>% mutate_at(c('dPar', 'g0Par', 'sigPar', 'subType'), as.factor)
+
+#at sigma == 2
+ggplot(SimData %>% filter(subType == 'full' & sigPar == 2), aes(g0Par, dPar)) +
+  geom_raster(aes(fill = dHatBiasPct)) +
+  ggtitle('Derived Density / Simulated Density (Full, Sigma = 2)')
+
+#at sigma == 3
+ggplot(SimData %>% filter(subType == 'full' & sigPar == 3), aes(g0Par, dPar)) +
+  geom_raster(aes(fill = dHatBiasPct)) +
+  ggtitle('Derived Density / Simulated Density (Full, Sigma = 3)')
+
+#at sigma == 4
+ggplot(SimData %>% filter(subType == 'full' & sigPar == 4), aes(g0Par, dPar)) +
+  geom_raster(aes(fill = dHatBiasPct)) + 
+  ggtitle('Derived Density / Simulated Density (Full, Sigma = 4)')
+
+
+#SRS25 raster
+#at sigma == 2
+ggplot(SimData %>% filter(subType == 'SRS25' & sigPar == 2), aes(g0Par, dPar)) +
+  geom_raster(aes(fill = dHatBiasPct)) +
+  ggtitle('Derived Density / Simulated Density (SRS25, Sigma = 2)')
+
+
+#at sigma == 3
+ggplot(SimData %>% filter(subType == 'SRS25' & sigPar == 3), aes(g0Par, dPar)) +
+  geom_raster(aes(fill = dHatBiasPct)) + 
+  ggtitle('Derived Density / Simulated Density (SRS25, Sigma = 3)')
+
+
+#at sigma == 4
+ggplot(SimData %>% filter(subType == 'SRS25' & sigPar == 4), aes(g0Par, dPar)) +
+  geom_raster(aes(fill = dHatBiasPct)) +
+  ggtitle('Derived Density / Simulated Density (SRS25, Sigma = 4)')
+
+
+```
+
+Without more sample size we might be limited in understanding... Probably need to run on a real machine, in parellel, to fill in the missing combos and get a better sample size for the higher g0 replicates. Though it does seem like high denPar and high g0 combo is leads to low biased estimates, and that low sample size combos (low density, low g0, and/or low sigma) leads to high biased estimates, like we found previously. Now, was there a trend in dHat_full/dHat_SRS25? - as of right now, too noisy. Going to run parallel for reps that produce low sample size and check again in a couple of days. 
+
+```{r eval = FALSE}
+SimDiscrep <- SimData %>% group_by(simID) %>%
+                          arrange(subType) %>% #arrange by full, then SRS, and take difference below 
+                          mutate(dHatFull_SRS = lead(dHat)/dHat,
+                                 sigHatFull_SRS = lead(sigHat)/sigHat,
+                                 g0HatFull_SRS = lead(g0Hat)/g0Hat,
+                                 subFullProp = lead(subFullProp)) %>% 
+                          filter(!is.na(dHatFull_SRS)) %>% 
+                          select(simID, nFull, subFullProp, dHatFull_SRS,
+                                 sigHatFull_SRS, g0HatFull_SRS, dPar, sigPar, g0Par) %>% 
+                          mutate_at(c('dPar', 'g0Par', 'sigPar'), as.factor)
+
+
+#high sigma reps
+#at sigma == 10
+ggplot(SimDiscrep %>% filter(sigPar == 10), aes(g0Par, dPar)) +
+  geom_raster(aes(fill = dHatFull_SRS)) +
+  ggtitle('Derived Density (SRS25) / Derived Density (Full), Sigma = 2')
+
+#at sigma == 8
+ggplot(SimDiscrep %>% filter(sigPar == 8), aes(g0Par, dPar)) +
+  geom_raster(aes(fill = dHatFull_SRS)) +
+  ggtitle('Derived Density (SRS25) / Derived Density (Full), Sigma = 3')
+
+#at sigma == 6
+ggplot(SimDiscrep %>% filter(sigPar == 6), aes(g0Par, dPar)) +
+  geom_raster(aes(fill = dHatFull_SRS)) +
+  ggtitle('Derived Density (SRS25) / Derived Density (Full), Sigma = 4')
+
+
+#low sigma reps
+#at sigma == 2
+ggplot(SimDiscrep %>% filter(sigPar == 2), aes(g0Par, dPar)) +
+  geom_raster(aes(fill = dHatFull_SRS)) +
+  ggtitle('Derived Density (SRS25) / Derived Density (Full), Sigma = 2')
+
+#at sigma == 3
+ggplot(SimDiscrep %>% filter(sigPar == 3), aes(g0Par, dPar)) +
+  geom_raster(aes(fill = dHatFull_SRS)) +
+  ggtitle('Derived Density (SRS25) / Derived Density (Full), Sigma = 3')
+
+#at sigma == 4
+ggplot(SimDiscrep %>% filter(sigPar == 4), aes(g0Par, dPar)) +
+  geom_raster(aes(fill = dHatFull_SRS)) +
+  ggtitle('Derived Density (SRS25) / Derived Density (Full), Sigma = 4')
+
+
+
+
+```
